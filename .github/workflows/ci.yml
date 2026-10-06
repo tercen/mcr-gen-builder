@@ -1,0 +1,93 @@
+name: ci
+# The build check for every push and PR (mcr-gen-builder template machinery).
+#
+# Template stage: only identity.json exists, so the running check is the
+# identity check. A fork that adds operator_spec.json, code.py and fixtures/
+# inherits the contract check and the determinacy check from this same
+# workflow — the gate the fork's registration rides (CI green on main =
+# registered). Nothing here is stubbed red: each check runs when its
+# content exists and reports its skip reason when it does not.
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: identity check
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          with open("identity.json") as f:
+              identity = json.load(f)
+
+          required = [
+              "generator", "repo_origin", "repo_sha", "code_hash",
+              "language", "isolation_intent", "protocol_version",
+              "harness", "model", "effort", "provider", "endpoint",
+          ]
+          missing = [k for k in required if k not in identity]
+          if missing:
+              sys.exit(f"identity.json is missing contract fields: {missing}")
+          extra = [k for k in identity if k not in required]
+          if extra:
+              sys.exit(f"identity.json carries fields outside the contract: {extra}")
+          print("identity.json: field list matches the #899 contract "
+                "(values may be null at template stage)")
+          EOF
+
+      - name: contract check
+        run: |
+          if [ -f operator_spec.json ]; then
+            python3 - <<'EOF'
+          import json, re, sys
+
+          with open("operator_spec.json") as f:
+              spec = json.load(f)
+
+          # D8 kind forms: `measurement`, `measurement[2]`, … ; a named slot
+          # renders `kind:name`. Refused: `measurement[0]`, unclosed brackets.
+          kind_form = re.compile(r"^[a-z_]+(:[a-zA-Z0-9_.-]+)?$")
+
+          def check_kinds(obj, where):
+              if isinstance(obj, str) and obj and not obj.startswith(("desc://", "sha:", "name@")):
+                  if re.search(r"\d|\[|\]", obj) or kind_form.match(obj) is None:
+                      if "[" in obj:
+                          if obj.count("[") != obj.count("]"):
+                              sys.exit(f"{where}: unclosed bracket in '{obj}'")
+                          m = re.search(r"\[(\d+)\]", obj)
+                          if m and m.group(1) == "0":
+                              sys.exit(f"{where}: zero index refused in '{obj}'")
+                  elif " " in obj or obj != obj.strip():
+                      sys.exit(f"{where}: '{obj}' is not a D8 kind form")
+
+          def walk(obj, where):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      walk(v, f"{where}.{k}")
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      walk(v, f"{where}[{i}]")
+              else:
+                  check_kinds(obj, where)
+
+          walk(spec, "operator_spec")
+          print("operator_spec.json parses; no malformed D8 index found")
+          EOF
+          else
+            echo "no operator_spec.json yet (template stage); contract check skips"
+          fi
+
+      - name: determinacy check
+        run: |
+          if [ -f code.py ] && compgen -G 'fixtures/*' > /dev/null; then
+            python3 code.py > /tmp/det_run1.out
+            python3 code.py > /tmp/det_run2.out
+            diff /tmp/det_run1.out /tmp/det_run2.out
+            echo "fold run twice on the same fixture: byte-equal"
+          else
+            echo "no code.py/fixtures yet (template stage); determinacy check skips"
+          fi
